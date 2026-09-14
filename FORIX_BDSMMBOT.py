@@ -9,6 +9,7 @@ Telegram Number Bot
 Main Admin: 8289191009
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -86,7 +87,7 @@ def init_db():
             phone TEXT NOT NULL, service_id INTEGER, panel_id INTEGER,
             panel_order_id TEXT, reward REAL DEFAULT 0,
             status TEXT DEFAULT 'active', taken_by INTEGER, taken_at TEXT,
-            otp_text TEXT, created_at TEXT
+            otp_text TEXT, rewarded INTEGER DEFAULT 0, created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS force_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +103,7 @@ def init_db():
     defaults = {
         "support_username": "", "bot_enabled": "1",
         "welcome_text": "Number Bot e welcome!\nPanel theke number nite parben.",
-        "default_reward": "0.01", "min_withdraw": "10", "withdraw_enabled": "1",
+        "default_reward": "0.01", "min_withdraw": "10", "withdraw_enabled": "1", "otp_group": "",
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -120,6 +121,14 @@ def init_db():
             "INSERT OR IGNORE INTO services (name, code, reward, is_active) VALUES (?,?,?,1)",
             (name, name.lower()[:8], reward),
         )
+    try:
+        cur.execute("ALTER TABLE numbers ADD COLUMN rewarded INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE numbers ADD COLUMN last_otp_id TEXT DEFAULT ''")
+    except Exception:
+        pass
     try:
         cur.execute("ALTER TABLE panels ADD COLUMN otp_url TEXT DEFAULT ''")
     except Exception:
@@ -339,17 +348,20 @@ def voltx_get_otp(api_key, phone):
     otps = (data or {}).get("otps") or []
     want = "".join(ch for ch in str(phone) if ch.isdigit())
     best = None
+    best_id = ""
     for item in otps:
         num = "".join(ch for ch in str(item.get("number") or "") if ch.isdigit())
         msg = item.get("message") or ""
         if want and (want in num or num in want or num.endswith(want[-8:])):
             best = msg
+            best_id = str(item.get("otp_id") or item.get("time") or msg)
             break
         if not best and msg:
             best = msg
+            best_id = str(item.get("otp_id") or item.get("time") or msg)
     if not best:
         return {"ok": False, "error": "OTP ekhono ashe nai"}
-    return {"ok": True, "otp": best}
+    return {"ok": True, "otp": best, "otp_id": best_id}
 
 
 def http_get(url, timeout=25):
@@ -431,6 +443,125 @@ def panel_get_otp(panel, phone, order_id=""):
         return {"ok": True, "otp": str(otp)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def number_result_kb(svc_id, num_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Change Number", callback_data="chg_%s_%s" % (svc_id, num_id))],
+        [InlineKeyboardButton("🔙 Back to Country", callback_data="back_svc")],
+        [InlineKeyboardButton("🔑 Get OTP", callback_data="otp_%s" % num_id)],
+    ])
+
+
+async def send_otp_targets(bot, user_id, phone, otp_text, service_name=""):
+    text = "📩 <b>OTP Received</b>\n📱 <code>%s</code>\n🏷 %s\n\n%s" % (
+        phone, service_name or "-", otp_text
+    )
+    try:
+        await bot.send_message(user_id, text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning("otp user send fail: %s", e)
+    grp = (get_setting("otp_group") or "").strip()
+    if grp:
+        chat = grp if grp.startswith("@") or grp.startswith("-") else ("@" + grp)
+        try:
+            await bot.send_message(chat, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.warning("otp group send fail: %s", e)
+
+
+def credit_otp_reward(num_id):
+    """Credit once when OTP first arrives. Returns (credited: bool, amount, balance)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM numbers WHERE id=?", (num_id,))
+    num = cur.fetchone()
+    if not num:
+        conn.close()
+        return False, 0, 0
+    if int(num["rewarded"] or 0) == 1:
+        cur.execute("SELECT balance FROM users WHERE user_id=?", (num["taken_by"],))
+        row = cur.fetchone()
+        conn.close()
+        return False, 0, (row["balance"] if row else 0)
+    amt = float(num["reward"] or 0)
+    cur.execute("UPDATE numbers SET rewarded=1 WHERE id=? AND rewarded=0", (num_id,))
+    if cur.rowcount == 0:
+        conn.close()
+        return False, 0, 0
+    cur.execute(
+        "UPDATE users SET balance = balance + ? WHERE user_id=?",
+        (amt, num["taken_by"]),
+    )
+    cur.execute("SELECT balance FROM users WHERE user_id=?", (num["taken_by"],))
+    bal = cur.fetchone()["balance"]
+    conn.commit()
+    conn.close()
+    return True, amt, bal
+
+
+async def apply_otp_if_new(bot, num_row, otp_text):
+    if not otp_text:
+        return False
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM numbers WHERE id=?", (num_row["id"],))
+    num = cur.fetchone()
+    if not num:
+        conn.close()
+        return False
+    old = (num["otp_text"] or "").strip()
+    cur.execute("UPDATE numbers SET otp_text=? WHERE id=?", (otp_text, num["id"]))
+    conn.commit()
+    conn.close()
+    first = (not old) or (old != otp_text)
+    if first:
+        svc_name = ""
+        conn = get_db()
+        cur = conn.cursor()
+        if num["service_id"]:
+            cur.execute("SELECT name FROM services WHERE id=?", (num["service_id"],))
+            s = cur.fetchone()
+            svc_name = s["name"] if s else ""
+        conn.close()
+        await send_otp_targets(bot, num["taken_by"], num["phone"], otp_text, svc_name)
+        credited, amt, bal = credit_otp_reward(num["id"])
+        if credited:
+            try:
+                await bot.send_message(
+                    num["taken_by"],
+                    "💰 OTP confirm — +%.2f যোগ হয়েছে। Balance: %.2f" % (amt, bal),
+                )
+            except Exception:
+                pass
+    return True
+
+
+async def watch_otp(bot, num_id):
+    """Poll panel for ~2 minutes after number received."""
+    try:
+        for _ in range(24):
+            await asyncio.sleep(5)
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM numbers WHERE id=?", (num_id,))
+            num = cur.fetchone()
+            panel = None
+            if num and num["panel_id"]:
+                cur.execute("SELECT * FROM panels WHERE id=?", (num["panel_id"],))
+                panel = cur.fetchone()
+            conn.close()
+            if not num or not panel:
+                return
+            if int(num["rewarded"] or 0) == 1 and (num["otp_text"] or "").strip():
+                return
+            res = panel_get_otp(panel, num["phone"], num["panel_order_id"] or "")
+            if res.get("ok") and res.get("otp") and "ashe nai" not in str(res.get("otp")).lower():
+                if res["otp"] and not str(res["otp"]).startswith("এখনো"):
+                    await apply_otp_if_new(bot, num, res["otp"])
+                    return
+    except Exception as e:
+        logger.warning("watch_otp: %s", e)
 
 
 def main_kb(admin=False):
@@ -607,19 +738,20 @@ async def gn_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO numbers (phone, service_id, panel_id, panel_order_id, reward, status, taken_by, taken_at, created_at) VALUES (?,?,?,?,?,'active',?,?,?)",
+        "INSERT INTO numbers (phone, service_id, panel_id, panel_order_id, reward, status, taken_by, taken_at, otp_text, rewarded, created_at) VALUES (?,?,?,?,?,'active',?,?, '', 0, ?)",
         (phone, svc_id, used_panel["id"], order_id, reward, uid, datetime.now().isoformat(), datetime.now().isoformat()),
     )
-    cur.execute("UPDATE users SET balance = balance + ?, numbers_taken = numbers_taken + 1 WHERE user_id=?", (reward, uid))
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
-    bal = cur.fetchone()["balance"]
+    nid = cur.lastrowid
+    cur.execute("UPDATE users SET numbers_taken = numbers_taken + 1 WHERE user_id=?", (uid,))
     conn.commit()
     conn.close()
     await q.edit_message_text(
-        "✅ <b>Number Received</b>\n\n📱 <code>%s</code>\n🏷 %s\n📡 %s\n🎁 +%.2f\n💰 %.2f\n\nOTP: SEARCH OTP চাপুন।"
-        % (phone, svc["name"], used_panel["name"], reward, bal),
+        "✅ <b>Number Received</b>\n\n📱 <code>%s</code>\n🏷 %s\n📡 %s\n\nOTP এলে ব্যালেন্স পাবেন (%.2f)।\nনিচের বাটন ব্যবহার করুন।"
+        % (phone, svc["name"], used_panel["name"], reward),
         parse_mode=ParseMode.HTML,
+        reply_markup=number_result_kb(svc_id, nid),
     )
+    asyncio.create_task(watch_otp(context.bot, nid))
 
 
 async def do_search_otp(update, context):
@@ -661,14 +793,20 @@ async def otp_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = panel_get_otp(panel, num["phone"], num["panel_order_id"] or "")
         if res.get("ok") and res.get("otp"):
             otp = res["otp"]
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute("UPDATE numbers SET otp_text=? WHERE id=?", (otp, nid))
-            conn.commit()
-            conn.close()
+            await apply_otp_if_new(context.bot, num, otp)
     if not otp:
         otp = "এখনো আসেনি — পরে চেষ্টা করুন।"
-    await q.edit_message_text("📱 <code>%s</code>\n🔑 OTP: <b>%s</b>" % (num["phone"], otp), parse_mode=ParseMode.HTML)
+        await q.edit_message_text(
+            "📱 <code>%s</code>\n🔑 OTP: <b>%s</b>" % (num["phone"], otp),
+            parse_mode=ParseMode.HTML,
+            reply_markup=number_result_kb(num["service_id"] or 0, nid),
+        )
+        return
+    await q.edit_message_text(
+        "📱 <code>%s</code>\n🔑 OTP:\n%s" % (num["phone"], otp),
+        parse_mode=ParseMode.HTML,
+        reply_markup=number_result_kb(num["service_id"] or 0, nid),
+    )
 
 
 async def do_balance(update, context):
@@ -817,6 +955,32 @@ async def padd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["await"] = "panel_add"
     await q.edit_message_text("নতুন Panel নাম:")
+
+
+async def back_svc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM services WHERE is_active=1 ORDER BY name")
+    services = cur.fetchall()
+    conn.close()
+    buttons = [[InlineKeyboardButton("%s 🎁 %.2f" % (s["name"], s["reward"]), callback_data="gn_%s" % s["id"])] for s in services]
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_inline")])
+    await q.edit_message_text("📱 কোন সার্ভিসের নাম্বার?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def chg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split("_")
+    # chg_{svc}_{nid}
+    if len(parts) < 3:
+        await q.edit_message_text("Invalid")
+        return
+    # reuse gn_cb by rewriting callback data
+    q.data = "gn_%s" % parts[1]
+    await gn_cb(update, context)
 
 
 async def cancel_inline_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1125,6 +1289,12 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅", reply_markup=admin_kb())
         return
 
+    if await_key == "set_otp_group" and is_admin(uid):
+        context.user_data.pop("await", None)
+        set_setting("otp_group", text.strip())
+        await update.message.reply_text("✅ OTP Group saved: %s" % text.strip(), reply_markup=admin_kb())
+        return
+
     if await_key == "broadcast" and is_admin(uid):
         context.user_data.pop("await", None)
         conn = get_db()
@@ -1279,10 +1449,11 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("Default Reward", callback_data="cfg_reward")],
                 [InlineKeyboardButton("Bot ON/OFF", callback_data="cfg_bot")],
                 [InlineKeyboardButton("Withdraw ON/OFF", callback_data="cfg_wd")],
+                [InlineKeyboardButton("📩 OTP Group", callback_data="cfg_otpgrp")],
             ])
             await update.message.reply_text(
-                "Support @%s\nMinWD %s\nReward %s\nBot %s WD %s"
-                % (get_setting("support_username") or "-", get_setting("min_withdraw"), get_setting("default_reward"), get_setting("bot_enabled"), get_setting("withdraw_enabled")),
+                "Support @%s\nMinWD %s\nReward %s\nBot %s WD %s\nOTP Group: %s"
+                % (get_setting("support_username") or "-", get_setting("min_withdraw"), get_setting("default_reward"), get_setting("bot_enabled"), get_setting("withdraw_enabled"), get_setting("otp_group") or "-"),
                 reply_markup=buttons,
             )
             return
@@ -1415,6 +1586,13 @@ async def cfg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = get_setting("withdraw_enabled", "1")
         set_setting("withdraw_enabled", "0" if cur == "1" else "1")
         await q.edit_message_text("withdraw_enabled=" + get_setting("withdraw_enabled"))
+    elif data == "cfg_otpgrp":
+        context.user_data["await"] = "set_otp_group"
+        await q.edit_message_text(
+            "OTP Group username বা chat id পাঠান।\n"
+            "উদাহরণ: @myotpgroup  অথবা  -1001234567890\n"
+            "বটকে সেই গ্রুপে Admin দিন।"
+        )
 
 
 async def wdok_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1477,6 +1655,8 @@ def main():
     app.add_handler(CallbackQueryHandler(gn_cb, pattern=r"^gn_\d+$"))
     app.add_handler(CallbackQueryHandler(otp_cb, pattern=r"^otp_\d+$"))
     app.add_handler(CallbackQueryHandler(cancel_inline_cb, pattern=r"^cancel_inline$"))
+    app.add_handler(CallbackQueryHandler(back_svc_cb, pattern=r"^back_svc$"))
+    app.add_handler(CallbackQueryHandler(chg_cb, pattern=r"^chg_"))
     app.add_handler(CallbackQueryHandler(ptog_cb, pattern=r"^ptog_\d+$"))
     app.add_handler(CallbackQueryHandler(pkey_cb, pattern=r"^pkey_\d+$"))
     app.add_handler(CallbackQueryHandler(purl_cb, pattern=r"^purl_\d+$"))
