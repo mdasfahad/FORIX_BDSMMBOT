@@ -104,7 +104,7 @@ def init_db():
         "support_username": "", "bot_enabled": "1",
         "welcome_text": "Number Bot e welcome!\nPanel theke number nite parben.",
         "default_reward": "0.01", "min_withdraw": "10", "withdraw_enabled": "1", "otp_group": "",
-        "ref_enabled": "1", "ref_pct": "10",
+        "owner_id": "8289191009", "ref_enabled": "1", "ref_pct": "10",
         "em_view": "⬇️", "em_change": "🔄", "em_back": "⚙️",
 
     }
@@ -197,7 +197,7 @@ def get_user(uid):
 
 
 def is_admin(uid):
-    if uid == MAIN_ADMIN_ID:
+    if uid == MAIN_ADMIN_ID or uid == owner_id():
         return True
     conn = get_db()
     cur = conn.cursor()
@@ -207,8 +207,15 @@ def is_admin(uid):
     return bool(r)
 
 
+def owner_id():
+    try:
+        return int(get_setting("owner_id") or MAIN_ADMIN_ID)
+    except Exception:
+        return MAIN_ADMIN_ID
+
+
 def is_main(uid):
-    return uid == MAIN_ADMIN_ID
+    return int(uid) == owner_id() or int(uid) == MAIN_ADMIN_ID
 
 
 def is_banned(uid):
@@ -253,14 +260,14 @@ def _http(url, method="GET", headers=None, body=None, timeout=30):
 
 
 def is_voltx_panel(panel):
+    """Key-only panels use Voltx-style mauthapi API (no extra URL)."""
+    key = (panel["api_key"] or "").strip()
+    extra = (panel["api_url"] or "").strip()
+    if key and not extra:
+        return True
     name = (panel["name"] or "").lower()
     url = ((panel["api_url"] or "") + (panel["otp_url"] or "")).lower()
-    return (
-        "volt" in name
-        or "2oo9.cloud" in url
-        or "voltxsms" in url
-        or (panel["api_key"] and not (panel["api_url"] or "").strip())
-    )
+    return "volt" in name or "2oo9.cloud" in url or "voltxsms" in url
 
 
 def voltx_headers(api_key):
@@ -489,12 +496,61 @@ def format_phone_line(phone, panel_name=""):
     return "📱 <code>%s</code>" % phone
 
 
+def enabled_panel_letters():
+    return ""
+
+def enabled_panel_letters():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM panels WHERE is_enabled=1 AND api_key IS NOT NULL AND trim(api_key) != '' ORDER BY sort_order")
+    rows = cur.fetchall()
+    conn.close()
+    tags = []
+    seen = set()
+    for r in rows:
+        n = (r["name"] or "?").strip()
+        ch = n[0].upper() if n else "?"
+        if ch not in seen:
+            seen.add(ch)
+            tags.append(ch)
+    return "".join("[%s]" % c for c in tags)
+
+
+def service_buttons(services):
+    letters = enabled_panel_letters()
+    buttons = []
+    for s in services:
+        label = ("%s %s 🎁 %.2f" % (s["name"], letters, s["reward"])) if letters else ("%s 🎁 %.2f" % (s["name"], s["reward"]))
+        buttons.append([InlineKeyboardButton(label, callback_data="gn_%s" % s["id"])])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_inline")])
+    return buttons
+
+
+def otp_group_url():
+    g = (get_setting("otp_group") or "").strip()
+    if not g:
+        return ""
+    if g.startswith("http://") or g.startswith("https://"):
+        return g
+    if g.startswith("@"):
+        return "https://t.me/" + g.lstrip("@")
+    if g.lstrip("-").isdigit():
+        return ""  # numeric id needs public username/link
+    return "https://t.me/" + g.lstrip("@")
+
+
 def number_result_kb(svc_id, num_id):
     ev = get_setting("em_view") or "⬇️"
     ec = get_setting("em_change") or "🔄"
     eb = get_setting("em_back") or "⚙️"
+    view = "%s View OTP" % ev
+    url = otp_group_url()
+    if url:
+        top = [InlineKeyboardButton(view, url=url)]
+    else:
+        top = [InlineKeyboardButton(view, callback_data="otp_%s" % num_id)]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("%s View OTP" % ev, callback_data="otp_%s" % num_id)],
+        top,
         [
             InlineKeyboardButton("%s Change" % ec, callback_data="chg_%s_%s" % (svc_id, num_id)),
             InlineKeyboardButton("%s Back" % eb, callback_data="back_svc"),
@@ -814,9 +870,7 @@ async def do_get_number(update, context):
     if not services:
         await update.message.reply_text("❌ Service নেই। Admin → SERVICE CONTROL।")
         return
-    buttons = [[InlineKeyboardButton("%s 🎁 %.2f" % (s["name"], s["reward"]), callback_data="gn_%s" % s["id"])] for s in services]
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_inline")])
-    await update.message.reply_text("📱 কোন সার্ভিসের নাম্বার? (Panel API থেকে)", reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text("📱 কোন সার্ভিসের নাম্বার? (Panel API থেকে)", reply_markup=InlineKeyboardMarkup(service_buttons(services)))
 
 
 async def gn_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1076,7 +1130,7 @@ async def padd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(q.from_user.id):
         return
     context.user_data["await"] = "panel_add"
-    await q.edit_message_text("নতুন Panel নাম:")
+    await q.edit_message_text("নতুন Panel নাম লিখুন। তারপর শুধু API Key সেট করুন — URL লাগবে না।")
 
 
 async def back_svc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1087,9 +1141,7 @@ async def back_svc_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT * FROM services WHERE is_active=1 ORDER BY name")
     services = cur.fetchall()
     conn.close()
-    buttons = [[InlineKeyboardButton("%s 🎁 %.2f" % (s["name"], s["reward"]), callback_data="gn_%s" % s["id"])] for s in services]
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_inline")])
-    await q.edit_message_text("📱 কোন সার্ভিসের নাম্বার?", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.edit_message_text("📱 কোন সার্ভিসের নাম্বার?", reply_markup=InlineKeyboardMarkup(service_buttons(services)))
 
 
 async def chg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1370,6 +1422,31 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(str(e))
         return
 
+    if await_key == "own_transfer" and is_main(uid):
+        context.user_data.pop("await", None)
+        try:
+            nid = int(text)
+            if nid == uid:
+                await update.message.reply_text("নিজেকে ট্রান্সফার নয়।")
+                return
+            set_setting("owner_id", str(nid))
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO admins (user_id, role, added_at) VALUES (?,?,?)",
+                (nid, "main", datetime.now().isoformat()),
+            )
+            conn.commit()
+            conn.close()
+            await update.message.reply_text("✅ Ownership transferred to %s" % nid, reply_markup=admin_kb())
+            try:
+                await context.bot.send_message(nid, "👑 আপনি এখন Main Owner।")
+            except Exception:
+                pass
+        except Exception as e:
+            await update.message.reply_text(str(e))
+        return
+
     if await_key == "admin_rm" and is_main(uid):
         context.user_data.pop("await", None)
         try:
@@ -1598,6 +1675,7 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buttons = InlineKeyboardMarkup([
                     [InlineKeyboardButton("➕ Add Admin", callback_data="aadd")],
                     [InlineKeyboardButton("🗑 Remove Admin", callback_data="arm")],
+                    [InlineKeyboardButton("👑 Ownership Transfer", callback_data="own_tr")],
                 ])
             await update.message.reply_text(msg, reply_markup=buttons or admin_kb())
             return
@@ -1711,6 +1789,16 @@ async def aadd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["await"] = "admin_add"
     await q.edit_message_text("New Admin User ID:")
+
+
+async def own_tr_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_main(q.from_user.id):
+        await q.answer("শুধু Main Owner", show_alert=True)
+        return
+    context.user_data["await"] = "own_transfer"
+    await q.edit_message_text("নতুন Owner এর Telegram User ID পাঠান:")
 
 
 async def arm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1857,6 +1945,7 @@ def main():
     app.add_handler(CallbackQueryHandler(crm_cb, pattern=r"^crm_\d+$"))
     app.add_handler(CallbackQueryHandler(aadd_cb, pattern=r"^aadd$"))
     app.add_handler(CallbackQueryHandler(arm_cb, pattern=r"^arm$"))
+    app.add_handler(CallbackQueryHandler(own_tr_cb, pattern=r"^own_tr$"))
     app.add_handler(CallbackQueryHandler(lang_cb, pattern=r"^lang_"))
     app.add_handler(CallbackQueryHandler(cfg_cb, pattern=r"^cfg_"))
     app.add_handler(CallbackQueryHandler(wdok_cb, pattern=r"^wdok_\d+$"))
