@@ -66,7 +66,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT, full_name TEXT,
             balance REAL DEFAULT 0, is_banned INTEGER DEFAULT 0,
-            numbers_taken INTEGER DEFAULT 0, joined_at TEXT
+            numbers_taken INTEGER DEFAULT 0, referrer_id INTEGER DEFAULT 0, lang TEXT DEFAULT 'bn', joined_at TEXT
         );
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY, role TEXT DEFAULT 'admin', added_at TEXT
@@ -104,6 +104,9 @@ def init_db():
         "support_username": "", "bot_enabled": "1",
         "welcome_text": "Number Bot e welcome!\nPanel theke number nite parben.",
         "default_reward": "0.01", "min_withdraw": "10", "withdraw_enabled": "1", "otp_group": "",
+        "ref_enabled": "1", "ref_pct": "10",
+        "em_view": "⬇️", "em_change": "🔄", "em_back": "⚙️",
+
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -121,6 +124,14 @@ def init_db():
             "INSERT OR IGNORE INTO services (name, code, reward, is_active) VALUES (?,?,?,1)",
             (name, name.lower()[:8], reward),
         )
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'bn'")
+    except Exception:
+        pass
     try:
         cur.execute("ALTER TABLE numbers ADD COLUMN rewarded INTEGER DEFAULT 0")
     except Exception:
@@ -352,13 +363,16 @@ def voltx_get_otp(api_key, phone):
     for item in otps:
         num = "".join(ch for ch in str(item.get("number") or "") if ch.isdigit())
         msg = item.get("message") or ""
-        if want and (want in num or num in want or num.endswith(want[-8:])):
+        matched = False
+        if want and num:
+            if want == num or want.endswith(num) or num.endswith(want):
+                matched = True
+            elif len(want) >= 8 and len(num) >= 8 and want[-8:] == num[-8:]:
+                matched = True
+        if matched and msg:
             best = msg
             best_id = str(item.get("otp_id") or item.get("time") or msg)
             break
-        if not best and msg:
-            best = msg
-            best_id = str(item.get("otp_id") or item.get("time") or msg)
     if not best:
         return {"ok": False, "error": "OTP ekhono ashe nai"}
     return {"ok": True, "otp": best, "otp_id": best_id}
@@ -445,17 +459,52 @@ def panel_get_otp(panel, phone, order_id=""):
         return {"ok": False, "error": str(e)}
 
 
+
+def panel_tag(name):
+    n = (name or "").strip()
+    if not n:
+        return "?"
+    return n[0].upper()
+
+
+def _panel_name(num_row):
+    try:
+        pid = num_row["panel_id"]
+    except Exception:
+        return ""
+    if not pid:
+        return ""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM panels WHERE id=?", (pid,))
+    r = cur.fetchone()
+    conn.close()
+    return r["name"] if r else ""
+
+
+def format_phone_line(phone, panel_name=""):
+    tag = panel_tag(panel_name)
+    if panel_name:
+        return "📱 <code>%s</code>  <b>[%s]</b> %s" % (phone, tag, panel_name)
+    return "📱 <code>%s</code>" % phone
+
+
 def number_result_kb(svc_id, num_id):
+    ev = get_setting("em_view") or "⬇️"
+    ec = get_setting("em_change") or "🔄"
+    eb = get_setting("em_back") or "⚙️"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Change Number", callback_data="chg_%s_%s" % (svc_id, num_id))],
-        [InlineKeyboardButton("🔙 Back to Country", callback_data="back_svc")],
-        [InlineKeyboardButton("🔑 Get OTP", callback_data="otp_%s" % num_id)],
+        [InlineKeyboardButton("%s View OTP" % ev, callback_data="otp_%s" % num_id)],
+        [
+            InlineKeyboardButton("%s Change" % ec, callback_data="chg_%s_%s" % (svc_id, num_id)),
+            InlineKeyboardButton("%s Back" % eb, callback_data="back_svc"),
+        ],
     ])
 
 
-async def send_otp_targets(bot, user_id, phone, otp_text, service_name=""):
-    text = "📩 <b>OTP Received</b>\n📱 <code>%s</code>\n🏷 %s\n\n%s" % (
-        phone, service_name or "-", otp_text
+async def send_otp_targets(bot, user_id, phone, otp_text, service_name="", panel_name=""):
+    text = "📩 <b>OTP Received</b>\n%s\n🏷 %s\n\n%s" % (
+        format_phone_line(phone, panel_name), service_name or "-", otp_text
     )
     try:
         await bot.send_message(user_id, text, parse_mode=ParseMode.HTML)
@@ -500,8 +549,45 @@ def credit_otp_reward(num_id):
     return True, amt, bal
 
 
+def is_real_panel_otp(text):
+    if not text:
+        return False
+    s = str(text).strip()
+    low = s.lower()
+    if any(x in low for x in ("ashe nai", "not found", "no otp", "ekhono", "এখনো", "fail", "error", "unauthorized")):
+        return False
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return len(digits) >= 4
+
+
+def pay_referral(earner_id, base_amt):
+    if get_setting("ref_enabled", "1") != "1":
+        return
+    try:
+        pct = float(get_setting("ref_pct") or 0)
+    except Exception:
+        pct = 0
+    if pct <= 0 or base_amt <= 0:
+        return
+    u = get_user(earner_id)
+    if not u:
+        return
+    rid = int(u["referrer_id"] or 0) if "referrer_id" in u.keys() else 0
+    if rid <= 0 or rid == earner_id:
+        return
+    commission = round(base_amt * pct / 100.0, 4)
+    if commission <= 0:
+        return
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (commission, rid))
+    conn.commit()
+    conn.close()
+    return rid, commission
+
+
 async def apply_otp_if_new(bot, num_row, otp_text):
-    if not otp_text:
+    if not is_real_panel_otp(otp_text):
         return False
     conn = get_db()
     cur = conn.cursor()
@@ -510,28 +596,44 @@ async def apply_otp_if_new(bot, num_row, otp_text):
     if not num:
         conn.close()
         return False
+    already = int(num["rewarded"] or 0) == 1
     old = (num["otp_text"] or "").strip()
     cur.execute("UPDATE numbers SET otp_text=? WHERE id=?", (otp_text, num["id"]))
     conn.commit()
     conn.close()
-    first = (not old) or (old != otp_text)
-    if first:
-        svc_name = ""
-        conn = get_db()
-        cur = conn.cursor()
-        if num["service_id"]:
-            cur.execute("SELECT name FROM services WHERE id=?", (num["service_id"],))
-            s = cur.fetchone()
-            svc_name = s["name"] if s else ""
-        conn.close()
-        await send_otp_targets(bot, num["taken_by"], num["phone"], otp_text, svc_name)
-        credited, amt, bal = credit_otp_reward(num["id"])
-        if credited:
+    if already:
+        return True
+    svc_name = ""
+    conn = get_db()
+    cur = conn.cursor()
+    if num["service_id"]:
+        cur.execute("SELECT name FROM services WHERE id=?", (num["service_id"],))
+        s = cur.fetchone()
+        svc_name = s["name"] if s else ""
+    conn.close()
+    pname = ""
+    if num["panel_id"]:
+        conn2 = get_db()
+        c2 = conn2.cursor()
+        c2.execute("SELECT name FROM panels WHERE id=?", (num["panel_id"],))
+        pr = c2.fetchone()
+        conn2.close()
+        pname = pr["name"] if pr else ""
+    await send_otp_targets(bot, num["taken_by"], num["phone"], otp_text, svc_name, pname)
+    credited, amt, bal = credit_otp_reward(num["id"])
+    if credited:
+        try:
+            await bot.send_message(
+                num["taken_by"],
+                "💰 OTP receive confirm — +%.2f | Balance: %.2f" % (amt, bal),
+            )
+        except Exception:
+            pass
+        ref = pay_referral(num["taken_by"], amt)
+        if ref:
+            rid, comm = ref
             try:
-                await bot.send_message(
-                    num["taken_by"],
-                    "💰 OTP confirm — +%.2f যোগ হয়েছে। Balance: %.2f" % (amt, bal),
-                )
+                await bot.send_message(rid, "🎁 Referral commission +%.2f (from %s)" % (comm, num["taken_by"]))
             except Exception:
                 pass
     return True
@@ -568,6 +670,7 @@ def main_kb(admin=False):
     rows = [
         [KeyboardButton("👤 GET NUMBER"), KeyboardButton("💬 SEARCH OTP")],
         [KeyboardButton("💰 BALANCE"), KeyboardButton("💸 WITHDRAW")],
+        [KeyboardButton("👥 REFER"), KeyboardButton("🌐 LANGUAGE")],
         [KeyboardButton("✈️ SUPPORT")],
     ]
     if admin:
@@ -637,6 +740,25 @@ async def send_force_join(update, context, missing):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username, user.full_name)
+    # referral: /start ref_123
+    if context.args:
+        arg = (context.args[0] or "").strip()
+        if arg.startswith("ref_"):
+            arg = arg[4:]
+        try:
+            rid = int(arg)
+            if rid != user.id:
+                conn = get_db()
+                cur = conn.cursor()
+                cur.execute("SELECT referrer_id FROM users WHERE user_id=?", (user.id,))
+                row = cur.fetchone()
+                current = int(row["referrer_id"] or 0) if row else 0
+                if current == 0 and get_user(rid):
+                    cur.execute("UPDATE users SET referrer_id=? WHERE user_id=?", (rid, user.id))
+                    conn.commit()
+                conn.close()
+        except Exception:
+            pass
     context.user_data.clear()
     if is_banned(user.id):
         await update.message.reply_text("🚫 আপনি ব্যান।")
@@ -746,8 +868,8 @@ async def gn_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     conn.close()
     await q.edit_message_text(
-        "✅ <b>Number Received</b>\n\n📱 <code>%s</code>\n🏷 %s\n📡 %s\n\nOTP এলে ব্যালেন্স পাবেন (%.2f)।\nনিচের বাটন ব্যবহার করুন।"
-        % (phone, svc["name"], used_panel["name"], reward),
+        "✅ <b>Number Received</b>\n\n%s\n🏷 %s\n\nOTP এলে ব্যালেন্স পাবেন (%.2f)।\nনিচের বাটন ব্যবহার করুন।"
+        % (format_phone_line(phone, used_panel["name"]), svc["name"], reward),
         parse_mode=ParseMode.HTML,
         reply_markup=number_result_kb(svc_id, nid),
     )
@@ -797,13 +919,13 @@ async def otp_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not otp:
         otp = "এখনো আসেনি — পরে চেষ্টা করুন।"
         await q.edit_message_text(
-            "📱 <code>%s</code>\n🔑 OTP: <b>%s</b>" % (num["phone"], otp),
+            "%s\n🔑 OTP: <b>%s</b>" % (format_phone_line(num["phone"], _panel_name(num)), otp),
             parse_mode=ParseMode.HTML,
             reply_markup=number_result_kb(num["service_id"] or 0, nid),
         )
         return
     await q.edit_message_text(
-        "📱 <code>%s</code>\n🔑 OTP:\n%s" % (num["phone"], otp),
+        "%s\n🔑 OTP:\n%s" % (format_phone_line(num["phone"], _panel_name(num)), otp),
         parse_mode=ParseMode.HTML,
         reply_markup=number_result_kb(num["service_id"] or 0, nid),
     )
@@ -1294,6 +1416,22 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("otp_group", text.strip())
         await update.message.reply_text("✅ OTP Group saved: %s" % text.strip(), reply_markup=admin_kb())
         return
+    if await_key == "set_ref_pct" and is_admin(uid):
+        context.user_data.pop("await", None)
+        set_setting("ref_pct", text.strip().replace("%", ""))
+        await update.message.reply_text("✅ Refer %% saved", reply_markup=admin_kb())
+        return
+    if await_key == "set_emoji" and is_admin(uid):
+        context.user_data.pop("await", None)
+        parts = text.split()
+        if len(parts) >= 3:
+            set_setting("em_view", parts[0])
+            set_setting("em_change", parts[1])
+            set_setting("em_back", parts[2])
+            await update.message.reply_text("✅ Emoji saved", reply_markup=admin_kb())
+        else:
+            await update.message.reply_text("৩টা ইমোজি দিন")
+        return
 
     if await_key == "broadcast" and is_admin(uid):
         context.user_data.pop("await", None)
@@ -1327,6 +1465,28 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text in ("✈️ SUPPORT", "SUPPORT"):
         await do_support(update, context)
+        return
+    if text in ("👥 REFER", "REFER", "👥 রেফার"):
+        me = await context.bot.get_me()
+        link = "https://t.me/%s?start=ref_%s" % (me.username, uid)
+        pct = get_setting("ref_pct") or "0"
+        on = get_setting("ref_enabled", "1")
+        await update.message.reply_text(
+            "👥 <b>Referral</b>\nStatus: %s\nCommission: %s%% (lifetime OTP earnings)\n\nYour link:\n<code>%s</code>"
+            % ("ON" if on == "1" else "OFF", pct, link),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if text in ("🌐 LANGUAGE", "LANGUAGE", "🌐 ভাষা"):
+        await update.message.reply_text(
+            "ভাষা সিলেক্ট করুন:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("বাংলা", callback_data="lang_bn"),
+                 InlineKeyboardButton("English", callback_data="lang_en")],
+                [InlineKeyboardButton("हिन्दी", callback_data="lang_hi"),
+                 InlineKeyboardButton("العربية", callback_data="lang_ar")],
+            ]),
+        )
         return
     if text in ("📍 ADMIN PANEL", "ADMIN PANEL") and is_admin(uid):
         await show_admin(update, context)
@@ -1450,6 +1610,9 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("Bot ON/OFF", callback_data="cfg_bot")],
                 [InlineKeyboardButton("Withdraw ON/OFF", callback_data="cfg_wd")],
                 [InlineKeyboardButton("📩 OTP Group", callback_data="cfg_otpgrp")],
+                [InlineKeyboardButton("🎁 Refer ON/OFF", callback_data="cfg_refon")],
+                [InlineKeyboardButton("🎁 Refer %", callback_data="cfg_refpct")],
+                [InlineKeyboardButton("😀 Button Emoji", callback_data="cfg_emoji")],
             ])
             await update.message.reply_text(
                 "Support @%s\nMinWD %s\nReward %s\nBot %s WD %s\nOTP Group: %s"
@@ -1560,6 +1723,19 @@ async def arm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("Remove Admin User ID:")
 
 
+async def lang_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    code = q.data.split("_")[1]
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET lang=? WHERE user_id=?", (code, q.from_user.id))
+    conn.commit()
+    conn.close()
+    names = {"bn": "বাংলা", "en": "English", "hi": "हिन्दी", "ar": "العربية"}
+    await q.edit_message_text("✅ Language: %s" % names.get(code, code))
+
+
 async def cfg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1592,6 +1768,18 @@ async def cfg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "OTP Group username বা chat id পাঠান।\n"
             "উদাহরণ: @myotpgroup  অথবা  -1001234567890\n"
             "বটকে সেই গ্রুপে Admin দিন।"
+        )
+    elif data == "cfg_refon":
+        cur = get_setting("ref_enabled", "1")
+        set_setting("ref_enabled", "0" if cur == "1" else "1")
+        await q.edit_message_text("ref_enabled=" + get_setting("ref_enabled"))
+    elif data == "cfg_refpct":
+        context.user_data["await"] = "set_ref_pct"
+        await q.edit_message_text("Referral commission percent (যেমন 10):")
+    elif data == "cfg_emoji":
+        context.user_data["await"] = "set_emoji"
+        await q.edit_message_text(
+            "৩টা ইমোজি স্পেস দিয়ে পাঠান:\nView Change Back\nযেমন: ⬇️ 🔄 ⚙️"
         )
 
 
@@ -1669,6 +1857,7 @@ def main():
     app.add_handler(CallbackQueryHandler(crm_cb, pattern=r"^crm_\d+$"))
     app.add_handler(CallbackQueryHandler(aadd_cb, pattern=r"^aadd$"))
     app.add_handler(CallbackQueryHandler(arm_cb, pattern=r"^arm$"))
+    app.add_handler(CallbackQueryHandler(lang_cb, pattern=r"^lang_"))
     app.add_handler(CallbackQueryHandler(cfg_cb, pattern=r"^cfg_"))
     app.add_handler(CallbackQueryHandler(wdok_cb, pattern=r"^wdok_\d+$"))
     app.add_handler(CallbackQueryHandler(wdrj_cb, pattern=r"^wdrj_\d+$"))
