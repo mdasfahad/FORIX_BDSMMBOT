@@ -196,20 +196,172 @@ def is_banned(uid):
     return bool(u and u["is_banned"])
 
 
-def http_get(url, timeout=25):
-    req = urllib.request.Request(url, headers={"User-Agent": "NumberBot/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+VOLTX_BASE = "https://api.2oo9.cloud/MXS47FLFX0U/tnevs/@public/api"
+
+
+def _http(url, method="GET", headers=None, body=None, timeout=30):
+    hdrs = {"User-Agent": "NumberBot/1.0", "Accept": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    data = None
+    if body is not None:
+        rawb = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+        data = rawb
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
-        return {"ok": True, "data": json.loads(raw), "raw": raw}
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            code = resp.getcode()
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        return {
+            "ok": False,
+            "status": e.code,
+            "error": "HTTP %s: %s" % (e.code, (err or e.reason)[:180]),
+            "raw": err,
+            "data": None,
+        }
+    except Exception as e:
+        return {"ok": False, "status": 0, "error": str(e), "raw": "", "data": None}
+    parsed = None
+    try:
+        parsed = json.loads(raw)
     except Exception:
-        return {"ok": True, "data": None, "raw": raw}
+        pass
+    return {"ok": True, "status": code, "raw": raw, "data": parsed}
+
+
+def is_voltx_panel(panel):
+    name = (panel["name"] or "").lower()
+    url = ((panel["api_url"] or "") + (panel["otp_url"] or "")).lower()
+    return (
+        "volt" in name
+        or "2oo9.cloud" in url
+        or "voltxsms" in url
+        or (panel["api_key"] and not (panel["api_url"] or "").strip())
+    )
+
+
+def voltx_headers(api_key):
+    return {"mauthapi": api_key.strip()}
+
+
+def _rid_from_range(rng):
+    s = str(rng or "").strip().upper().replace("X", "")
+    s = "".join(ch for ch in s if ch.isdigit())
+    return s
+
+
+def voltx_pick_rid(api_key, service_code):
+    res = _http(VOLTX_BASE + "/liveaccess", headers=voltx_headers(api_key))
+    if not res.get("ok"):
+        return None, res.get("error") or "liveaccess fail"
+    data = (res.get("data") or {}).get("data") or res.get("data") or {}
+    services = data.get("services") if isinstance(data, dict) else []
+    want = (service_code or "").lower()
+    rids = []
+    for svc in services or []:
+        sid = str(svc.get("sid") or "")
+        ranges = svc.get("ranges") or []
+        matched = (not want) or want in sid.lower() or sid.lower() in want
+        if matched:
+            for rng in ranges:
+                rid = _rid_from_range(rng)
+                if rid:
+                    rids.append(rid)
+    if not rids:
+        for svc in services or []:
+            for rng in svc.get("ranges") or []:
+                rid = _rid_from_range(rng)
+                if rid:
+                    rids.append(rid)
+    if not rids:
+        return None, "liveaccess e range/rid pai nai"
+    return rids, None
+
+
+def voltx_get_number(api_key, service_code):
+    key = (api_key or "").strip()
+    if not key:
+        return {"ok": False, "error": "API Key NOT SET"}
+    rids, err = voltx_pick_rid(key, service_code)
+    if err and not rids:
+        # still try a POST without liveaccess — some accounts only need getnum
+        rids = []
+    last = err or "getnum fail"
+    tried = list(rids or [])
+    if not tried:
+        tried = [""]  # last resort empty — API may reject
+    for rid in tried:
+        body = {"rid": rid} if rid else {}
+        res = _http(
+            VOLTX_BASE + "/getnum",
+            method="POST",
+            headers=voltx_headers(key),
+            body=body,
+        )
+        if not res.get("ok"):
+            last = res.get("error") or last
+            # 401/403 stop immediately
+            if res.get("status") in (401, 403):
+                extra = " — Profile e API access ON koro, key thik kina dekho."
+                return {"ok": False, "error": last + extra}
+            continue
+        payload = res.get("data") or {}
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        code = (meta or {}).get("code")
+        if code not in (None, 200, "200") or not data:
+            last = payload.get("message") or res.get("raw", "")[:180] or "no number"
+            continue
+        phone = (
+            data.get("full_number")
+            or data.get("no_plus_number")
+            or data.get("national_number")
+        )
+        if phone:
+            phone = str(phone).replace(" ", "")
+            return {"ok": True, "phone": phone, "order_id": str(rid or data.get("rid") or "")}
+        last = "response e number nai"
+    return {"ok": False, "error": last}
+
+
+def voltx_get_otp(api_key, phone):
+    key = (api_key or "").strip()
+    if not key:
+        return {"ok": False, "error": "API Key NOT SET"}
+    res = _http(VOLTX_BASE + "/success-otp", headers=voltx_headers(key))
+    if not res.get("ok"):
+        return {"ok": False, "error": res.get("error") or "otp fail"}
+    payload = res.get("data") or {}
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    otps = (data or {}).get("otps") or []
+    want = "".join(ch for ch in str(phone) if ch.isdigit())
+    best = None
+    for item in otps:
+        num = "".join(ch for ch in str(item.get("number") or "") if ch.isdigit())
+        msg = item.get("message") or ""
+        if want and (want in num or num in want or num.endswith(want[-8:])):
+            best = msg
+            break
+        if not best and msg:
+            best = msg
+    if not best:
+        return {"ok": False, "error": "OTP ekhono ashe nai"}
+    return {"ok": True, "otp": best}
+
+
+def http_get(url, timeout=25):
+    return _http(url, method="GET")
 
 
 def panel_get_number(panel, service_code):
     key = (panel["api_key"] or "").strip()
     if not key:
         return {"ok": False, "error": "API Key NOT SET"}
+    if is_voltx_panel(panel):
+        return voltx_get_number(key, service_code)
     base = (panel["api_url"] or "").strip()
     if not base:
         return {"ok": False, "error": "Get Number URL set nai (Panel Control)"}
@@ -225,6 +377,8 @@ def panel_get_number(panel, service_code):
         )
     try:
         res = http_get(url)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "fail"}
         data = res.get("data") or {}
         raw = res.get("raw", "")
         phone = order_id = None
@@ -247,9 +401,11 @@ def panel_get_number(panel, service_code):
 
 def panel_get_otp(panel, phone, order_id=""):
     key = (panel["api_key"] or "").strip()
-    base = (panel["otp_url"] or "").strip()
     if not key:
         return {"ok": False, "error": "API Key NOT SET"}
+    if is_voltx_panel(panel):
+        return voltx_get_otp(key, phone)
+    base = (panel["otp_url"] or "").strip()
     if not base:
         return {"ok": False, "error": "OTP URL set nai"}
     url = (
@@ -261,6 +417,8 @@ def panel_get_otp(panel, phone, order_id=""):
     )
     try:
         res = http_get(url)
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "otp fail"}
         data = res.get("data") or {}
         raw = res.get("raw", "")
         otp = None
